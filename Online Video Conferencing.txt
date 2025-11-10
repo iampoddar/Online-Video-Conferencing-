@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC Video Conference</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Firebase libraries -->
+    <script type="module">
+        // Import the functions you need from the SDKs you need
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            doc, 
+            setDoc, 
+            getDoc, 
+            addDoc, 
+            onSnapshot, 
+            collection, 
+            updateDoc,
+            deleteDoc,
+            writeBatch
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Global Variables ---
+        let db, auth, app;
+        let peerConnection;
+        let localStream;
+        let remoteStream;
+        let roomId;
+        let unsubscribeRoom; // To stop listening to Firestore changes
+
+        // --- DOM Elements ---
+        const localVideo = document.getElementById('localVideo');
+        const remoteVideo = document.getElementById('remoteVideo');
+        const createCallBtn = document.getElementById('createCallBtn');
+        const joinCallBtn = document.getElementById('joinCallBtn');
+        const hangUpBtn = document.getElementById('hangUpBtn');
+        const roomIdInput = document.getElementById('roomIdInput');
+        const currentRoomDisplay = document.getElementById('currentRoomDisplay');
+        const copyRoomIdBtn = document.getElementById('copyRoomIdBtn');
+        const statusMessage = document.getElementById('statusMessage');
+        const videosContainer = document.getElementById('videosContainer');
+
+        // --- App ID and Firebase Config ---
+        // These are provided by the environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        let firebaseConfig;
+        try {
+            firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        } catch (e) {
+            console.error("Firebase config is not valid JSON", e);
+            showStatus("Error: Invalid Firebase configuration.", 'error');
+            return;
+        }
+
+        // --- STUN servers for WebRTC ---
+        // These are public Google servers to help devices find each other
+        const configuration = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' },
+            ],
+            iceCandidatePoolSize: 10,
+        };
+
+        // --- 1. Initialize Firebase ---
+        async function initializeFirebase() {
+            if (!firebaseConfig || !firebaseConfig.apiKey) {
+                showStatus("Firebase configuration is missing or incomplete.", 'error');
+                console.error("Firebase config is missing or incomplete.");
+                return;
+            }
+            
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                showStatus("Connecting to authentication...", 'pending');
+                
+                // Sign in
+                const userCredential = typeof __initial_auth_token !== 'undefined' 
+                    ? await signInWithCustomToken(auth, __initial_auth_token)
+                    : await signInAnonymously(auth);
+                
+                const userId = userCredential.user.uid;
+                console.log('User signed in with UID:', userId);
+                showStatus("Ready to start or join a call.", 'success');
+                
+                // Enable UI buttons after successful auth
+                createCallBtn.disabled = false;
+                joinCallBtn.disabled = false;
+
+            } catch (error) {
+                console.error('Firebase Initialization Error:', error);
+                showStatus("Error connecting to services.", 'error');
+            }
+        }
+        
+        // --- 2. Setup Media & UI Listeners ---
+        function setupUIListeners() {
+            createCallBtn.addEventListener('click', createCall);
+            joinCallBtn.addEventListener('click', joinCall);
+            hangUpBtn.addEventListener('click', hangUp);
+            copyRoomIdBtn.addEventListener('click', copyRoomId);
+
+            // Disable join button if input is empty
+            roomIdInput.addEventListener('input', () => {
+                joinCallBtn.disabled = !roomIdInput.value.trim();
+            });
+        }
+        
+        /**
+         * Gets user's camera and microphone, displays it locally
+         */
+        async function setupLocalMedia() {
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                localVideo.srcObject = localStream;
+                remoteStream = new MediaStream();
+                remoteVideo.srcObject = remoteStream;
+                videosContainer.classList.remove('hidden');
+                showStatus("Local camera feed established.", 'success');
+            } catch (error) {
+                console.error('Error accessing media devices.', error);
+                showStatus("Error: Could not access camera or microphone.", 'error');
+            }
+        }
+
+        // --- 3. Create Call (Caller Flow) ---
+        async function createCall() {
+            // Disable buttons to prevent weird states
+            createCallBtn.disabled = true;
+            joinCallBtn.disabled = true;
+            roomIdInput.disabled = true;
+            
+            showStatus("Starting your camera...", 'pending');
+            await setupLocalMedia();
+            if (!localStream) {
+                showStatus("Failed to start camera. Check permissions.", 'error');
+                createCallBtn.disabled = false;
+                joinCallBtn.disabled = false;
+                roomIdInput.disabled = false;
+                return;
+            }
+
+            showStatus("Creating call room...", 'pending');
+            
+            // Create a new room in the public collection
+            const roomCollection = collection(db, `artifacts/${appId}/public/data/webrtc_rooms`);
+            const newRoomRef = doc(roomCollection); // Auto-generates an ID
+            roomId = newRoomRef.id;
+
+            // Display the room ID for sharing
+            currentRoomDisplay.value = roomId;
+            currentRoomDisplay.classList.remove('hidden');
+            copyRoomIdBtn.classList.remove('hidden');
+
+            // --- WebRTC Logic (Caller) ---
+            peerConnection = new RTCPeerConnection(configuration);
+            
+            // Add local tracks to the connection
+            localStream.getTracks().forEach(track => {
+                peerConnection.addTrack(track, localStream);
+            });
+
+            // Listen for remote tracks
+            peerConnection.ontrack = (event) => {
+                event.streams[0].getTracks().forEach(track => {
+                    remoteStream.addTrack(track);
+                });
+            };
+
+            // Generate and store ICE candidates
+            const callerCandidatesCollection = collection(newRoomRef, 'callerCandidates');
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                    addDoc(callerCandidatesCollection, event.candidate.toJSON());
+                }
+            };
+
+            // Create an "offer"
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+            
+            const roomWithOffer = {
+                offer: {
+                    type: offer.type,
+                    sdp: offer.sdp,
+                },
+                createdAt: new Date()
+            };
+            
+            // Set the offer in the room document
+            await setDoc(newRoomRef, roomWithOffer);
+            showStatus("Room created. Send the ID to a friend!", 'success');
+            
+            // --- Listen for Answer (Caller) ---
+            unsubscribeRoom = onSnapshot(newRoomRef, async (snapshot) => {
+                const data = snapshot.data();
+                
+                // When the callee "answers"
+                if (!peerConnection.currentRemoteDescription && data?.answer) {
+                    showStatus("Friend is connecting...", 'pending');
+                    const answerDescription = new RTCSessionDescription(data.answer);
+                    await peerConnection.setRemoteDescription(answerDescription);
+                    
+                    // Show hangup button
+                    hangUpBtn.classList.remove('hidden');
+                    createCallBtn.classList.add('hidden');
+                    joinCallBtn.classList.add('hidden');
+                    roomIdInput.classList.add('hidden');
+                    document.getElementById('join-container').classList.add('hidden');
+                }
+
+                // When the call is hung up by the other user
+                if (data === undefined && !peerConnection.currentRemoteDescription) {
+                    showStatus("Call was cancelled before connection.", 'success');
+                    await hangUp();
+                }
+            });
+
+            // Listen for callee's ICE candidates
+            const calleeCandidatesCollection = collection(newRoomRef, 'calleeCandidates');
+            onSnapshot(calleeCandidatesCollection, (snapshot) => {
+                snapshot.docChanges().forEach(async (change) => {
+                    if (change.type === 'added') {
+                        try {
+                            await peerConnection.addIceCandidate(new RTCIceCandidate(change.doc.data()));
+                        } catch (e) {
+                            console.error('Error adding received ice candidate', e);
+                        }
+                    }
+                });
+            });
+        }
+
+        // --- 4. Join Call (Callee Flow) ---
+        async function joinCall() {
+            roomId = roomIdInput.value.trim();
+            if (!roomId) {
+                showStatus("Please enter a valid Room ID.", 'error');
+                return;
+            }
+            
+            // Disable buttons
+            createCallBtn.disabled = true;
+            joinCallBtn.disabled = true;
+            roomIdInput.disabled = true;
+            
+            showStatus("Joining call...", 'pending');
+
+            const roomRef = doc(db, `artifacts/${appId}/public/data/webrtc_rooms`, roomId);
+            const roomSnapshot = await getDoc(roomRef);
+
+            if (!roomSnapshot.exists() || !roomSnapshot.data().offer) {
+                showStatus("Error: Invalid Room ID or call already started.", 'error');
+                createCallBtn.disabled = false;
+                joinCallBtn.disabled = false;
+                roomIdInput.disabled = false;
+                return;
+            }
+            
+            showStatus("Starting your camera...", 'pending');
+            await setupLocalMedia();
+            if (!localStream) {
+                showStatus("Failed to start camera. Check permissions.", 'error');
+                createCallBtn.disabled = false;
+                joinCallBtn.disabled = false;
+                roomIdInput.disabled = false;
+                return;
+            }
+            
+            showStatus("Connecting...", 'pending');
+
+            // --- WebRTC Logic (Callee) ---
+            peerConnection = new RTCPeerConnection(configuration);
+            
+            // Add local tracks
+            localStream.getTracks().forEach(track => {
+                peerConnection.addTrack(track, localStream);
+            });
+
+            // Listen for remote tracks
+            peerConnection.ontrack = (event) => {
+                event.streams[0].getTracks().forEach(track => {
+                    remoteStream.addTrack(track);
+                });
+            };
+
+            // Store ICE candidates
+            const calleeCandidatesCollection = collection(roomRef, 'calleeCandidates');
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                    addDoc(calleeCandidatesCollection, event.candidate.toJSON());
+                }
+            };
+
+            // Get offer from Firestore
+            const offer = roomSnapshot.data().offer;
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+
+            // Create an "answer"
+            const answer = await peerConnection.createAnswer();
+            await peerConnection.setLocalDescription(answer);
+            
+            const roomWithAnswer = {
+                answer: {
+                    type: answer.type,
+                    sdp: answer.sdp,
+                },
+            };
+            
+            // Send answer back to Firestore
+            await updateDoc(roomRef, roomWithAnswer);
+
+            // Listen for caller's ICE candidates
+            const callerCandidatesCollection = collection(roomRef, 'callerCandidates');
+            onSnapshot(callerCandidatesCollection, (snapshot) => {
+                snapshot.docChanges().forEach(async (change) => {
+                    if (change.type === 'added') {
+                        try {
+                            await peerConnection.addIceCandidate(new RTCIceCandidate(change.doc.data()));
+                        } catch (e) {
+                            console.error('Error adding received ice candidate', e);
+                        }
+                    }
+                });
+            });
+
+            // Show hangup button
+            hangUpBtn.classList.remove('hidden');
+            createCallBtn.classList.add('hidden');
+            joinCallBtn.classList.add('hidden');
+            roomIdInput.classList.add('hidden');
+            document.getElementById('join-container').classList.add('hidden');
+
+            // --- Listen for Hangup ---
+            unsubscribeRoom = onSnapshot(roomRef, (snapshot) => {
+                // If the room document is deleted, the call has ended
+                if (!snapshot.exists()) {
+                    showStatus("The other user has ended the call.", 'success');
+                    hangUp(false); // Don't delete the doc again
+                }
+            });
+        }
+
+        // --- 5. Hang Up & Cleanup ---
+        async function hangUp(deleteRoom = true) {
+            showStatus("Ending call...", 'pending');
+            
+            // Stop all tracks
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+            }
+            if (remoteStream) {
+                remoteStream.getTracks().forEach(track => track.stop());
+            }
+
+            // Close connection
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+
+            // Reset video elements
+            localVideo.srcObject = null;
+            remoteVideo.srcObject = null;
+            videosContainer.classList.add('hidden');
+            
+            // Stop listening to Firestore
+            if (unsubscribeRoom) {
+                unsubscribeRoom();
+            }
+
+            // Delete the room from Firestore
+            if (deleteRoom && roomId) {
+                try {
+                    const roomRef = doc(db, `artifacts/${appId}/public/data/webrtc_rooms`, roomId);
+                    
+                    // Need to delete subcollections (candidates) first
+                    const callerCandidatesRef = collection(roomRef, 'callerCandidates');
+                    const calleeCandidatesRef = collection(roomRef, 'calleeCandidates');
+                    
+                    const batch = writeBatch(db);
+
+                    const callerCandidatesSnap = await getDocs(callerCandidatesRef);
+                    callerCandidatesSnap.forEach(doc => batch.delete(doc.ref));
+                    
+                    const calleeCandidatesSnap = await getDocs(calleeCandidatesRef);
+                    calleeCandidatesSnap.forEach(doc => batch.delete(doc.ref));
+
+                    await batch.commit(); // Delete candidates
+                    await deleteDoc(roomRef); // Delete main room doc
+                    
+                } catch (error) {
+                    console.error("Error cleaning up room:", error);
+                }
+            }
+            
+            // Reset UI
+            roomId = null;
+            roomIdInput.value = '';
+            currentRoomDisplay.value = '';
+            currentRoomDisplay.classList.add('hidden');
+            copyRoomIdBtn.classList.add('hidden');
+            hangUpBtn.classList.add('hidden');
+            createCallBtn.classList.remove('hidden');
+            joinCallBtn.classList.remove('hidden');
+            roomIdInput.classList.remove('hidden');
+            document.getElementById('join-container').classList.remove('hidden');
+
+            createCallBtn.disabled = false;
+            joinCallBtn.disabled = true; // Disabled until user types
+            roomIdInput.disabled = false;
+            
+            showStatus("Call ended. Ready to start a new call.", 'success');
+        }
+
+        // --- Utility Functions ---
+        function showStatus(message, type = 'pending') {
+            statusMessage.textContent = message;
+            statusMessage.classList.remove('text-green-600', 'text-red-600', 'text-gray-600', 'text-blue-600');
+            if (type === 'success') {
+                statusMessage.classList.add('text-green-600');
+            } else if (type === 'error') {
+                statusMessage.classList.add('text-red-600');
+            } else if (type === 'pending') {
+                statusMessage.classList.add('text-blue-600');
+            } else {
+                statusMessage.classList.add('text-gray-600');
+            }
+        }
+
+        function copyRoomId() {
+            if (navigator.clipboard) {
+                navigator.clipboard.writeText(currentRoomDisplay.value).then(() => {
+                    showStatus("Room ID copied to clipboard!", 'success');
+                    setTimeout(() => showStatus("Room created. Send the ID to a friend!", 'success'), 2000);
+                }).catch(err => {
+                    console.error('Failed to copy: ', err);
+                    // Fallback for older browsers
+                    currentRoomDisplay.select();
+                    document.execCommand('copy');
+                });
+            } else {
+                // Fallback for older browsers
+                currentRoomDisplay.select();
+                document.execCommand('copy');
+                showStatus("Room ID copied to clipboard!", 'success');
+                setTimeout(() => showStatus("Room created. Send the ID to a friend!", 'success'), 2000);
+            }
+        }
+        
+        // --- Start the App ---
+        document.addEventListener('DOMContentLoaded', () => {
+            setupUIListeners();
+            initializeFirebase();
+        });
+
+    </script>
+</head>
+<body class="font-sans bg-slate-100 h-screen text-slate-800">
+
+    <div class="container mx-auto p-4 max-w-4xl">
+        <!-- Header -->
+        <header class="bg-blue-600 text-white p-4 rounded-lg shadow-md mb-6">
+            <h1 class="text-3xl font-bold text-center">Video Conferencing App</h1>
+            <p class="text-center text-blue-100">Powered by WebRTC and Firebase</p>
+        </header>
+
+        <!-- Status Message -->
+        <div class="bg-white p-4 rounded-lg shadow-md mb-6">
+            <p class="text-center font-medium">
+                Status: <span id="statusMessage" class="text-gray-600">Initializing...</span>
+            </p>
+        </div>
+
+        <!-- Video Feeds -->
+        <div id="videosContainer" class="hidden grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+            <div class="bg-black rounded-lg shadow-inner overflow-hidden aspect-video">
+                <video id="localVideo" muted autoplay playsinline class="w-full h-full object-cover"></video>
+                <div class="absolute bottom-2 left-2 bg-black bg-opacity-50 text-white px-2 py-1 rounded text-sm">
+                    Your Video
+                </div>
+            </div>
+            <div class="bg-black rounded-lg shadow-inner overflow-hidden aspect-video">
+                <video id="remoteVideo" autoplay playsinline class="w-full h-full object-cover"></video>
+                <div class="absolute bottom-2 left-2 bg-black bg-opacity-50 text-white px-2 py-1 rounded text-sm">
+                    Friend's Video
+                </div>
+            </div>
+        </div>
+
+        <!-- Controls -->
+        <div class="bg-white p-6 rounded-lg shadow-md">
+            <div class="flex flex-col md:flex-row gap-4 items-center justify-center">
+                <!-- Create Call -->
+                <button 
+                    id="createCallBtn" 
+                    disabled
+                    class="w-full md:w-auto px-6 py-3 bg-green-600 text-white rounded-lg font-semibold shadow hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition duration-200">
+                    Start a Call
+                </button>
+                
+                <!-- Join Call -->
+                <div id="join-container" class="flex flex-col md:flex-row gap-2 w-full md:w-auto">
+                    <input 
+                        type="text" 
+                        id="roomIdInput"
+                        placeholder="Enter Room ID to join"
+                        class="flex-1 md:w-64 px-4 py-3 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    />
+                    <button 
+                        id="joinCallBtn" 
+                        disabled
+                        class="w-full md:w-auto px-6 py-3 bg-blue-600 text-white rounded-lg font-semibold shadow hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition duration-200">
+                        Join Call
+                    </button>
+                </div>
+            </div>
+
+            <!-- Current Room ID Display (for creator) -->
+            <div class="mt-4 flex justify-center items-center gap-2">
+                <input 
+                    type="text" 
+                    id="currentRoomDisplay" 
+                    readonly 
+                    class="hidden flex-1 max-w-sm bg-slate-100 border border-slate-300 rounded-lg px-3 py-2 text-center text-slate-700 font-mono"
+                />
+                <button id="copyRoomIdBtn" class="hidden px-4 py-2 bg-slate-200 text-slate-800 rounded-lg hover:bg-slate-300">
+                    Copy ID
+                </button>
+            </div>
+
+            <!-- Hang Up Button (visible during call) -->
+            <div class="mt-6 text-center">
+                <button 
+                    id="hangUpBtn" 
+                    class="hidden w-full md:w-1/2 max-w-xs px-6 py-3 bg-red-600 text-white rounded-lg font-semibold shadow hover:bg-red-700 transition duration-200">
+                    Hang Up
+                </button>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
